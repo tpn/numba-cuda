@@ -1174,3 +1174,102 @@ def cuda_dispatcher_const(context, builder, ty, pyval):
 # NumPy
 
 register_ufuncs(ufunc_db.get_ufuncs(), lower)
+
+# cuda.cooperative
+
+
+@lower_attr(types.Module(cuda), "BlockLoadAlgorithm")
+def lower_block_load_algorithm(context, builder, typ, val):
+    """
+    Lower the BlockLoadAlgorithm enum to a constant value.
+    """
+    if isinstance(val, types.EnumMember):
+        # This is a compile-time constant
+        return context.get_constant(types.int32, val.value)
+    else:
+        # This is a run-time value, we cannot lower it
+        raise errors.ConstantInferenceError(
+            "BlockLoadAlgorithm must be a compile-time constant"
+        )
+
+
+@lower_attr(types.Module(cuda), "BlockStoreAlgorithm")
+def lower_block_store_algorithm(context, builder, typ, val):
+    """
+    Lower the BlockStoreAlgorithm enum to a constant value.
+    """
+    if isinstance(val, types.EnumMember):
+        # This is a compile-time constant
+        return context.get_constant(types.int32, val.value)
+    else:
+        # This is a run-time value, we cannot lower it
+        raise errors.ConstantInferenceError(
+            "BlockStoreAlgorithm must be a compile-time constant"
+        )
+
+
+LOAD_STORE_SIGNATURE1 = (
+    types.Array,  # src or dst
+    types.Array,  # dst or src
+    types.Integer,  # threads_per_block
+    types.Integer,  # items_per_thread
+)
+
+LOAD_STORE_SIGNATURE2 = (
+    types.Array,  # src or dst
+    types.Array,  # dst or src
+    types.Integer,  # threads_per_block
+    types.Integer,  # items_per_thread
+    types.EnumMember,  # algorithm
+)
+
+# @lower(cuda.block.load, *LOAD_STORE_SIGNATURE1)
+# @lower(cuda.block.load, *LOAD_STORE_SIGNATURE2)
+
+
+@lower(cuda.block.load, types.VarArg(types.Any))
+def lower_block_load(context, builder, sig, args):
+    # import ipdb
+    # ipdb.set_trace()
+
+    print("LOWER BLOCK LOAD ARRIVED!")
+    src_ty, dst_ty, tpblock_ty, items_ty, algo_ty = sig.args
+    src_val, dst_val, tpblock_val, items_val, algo_val = args
+
+    # ------------------------------------------------------------------
+    # 1.  Recover the *compile-time* literal values
+    # ------------------------------------------------------------------
+    n_threads = tpblock_ty.literal_value  # python int
+    n_items = items_ty.literal_value  # python int
+    # algo_id = algo_ty.literal_value  # 0..5 for your BlockLoadAlgorithm
+
+    # Optional: run-time asserts (useful while prototyping)
+    assert n_threads > 0 and n_items > 0
+
+    print("LOWER BLOCK LOAD ARRIVED!")
+
+
+# @lower(cuda.block.store, *LOAD_STORE_SIGNATURE1)
+# @lower(cuda.block.store, *LOAD_STORE_SIGNATURE2)
+
+
+@lower(cuda.block.load, types.VarArg(types.Any))
+def lower_block_store(context, builder, sig, args):
+    # import ipdb
+    # ipdb.set_trace()
+
+    print("LOWER BLOCK STORE ARRIVED!")
+    src_ty, dst_ty, tpblock_ty, items_ty, algo_ty = sig.args
+    src_val, dst_val, tpblock_val, items_val, algo_val = args
+
+    # ------------------------------------------------------------------
+    # 1.  Recover the *compile-time* literal values
+    # ------------------------------------------------------------------
+    n_threads = tpblock_ty.literal_value  # python int
+    n_items = items_ty.literal_value  # python int
+    # algo_id = algo_ty.literal_value  # 0..5 for your BlockStoreAlgorithm
+
+    # Optional: run-time asserts (useful while prototyping)
+    assert n_threads > 0 and n_items > 0
+
+    print("LOWER BLOCK STORE ARRIVED!")

@@ -11,5 +11,9 @@ def initialize_all():
     )
 
     cuda_target = target_registry["cuda"]
-    jit_registry[cuda_target] = jit
-    dispatcher_registry[cuda_target] = CUDADispatcher
+
+    # Check if CUDA target is already registered to avoid conflicts
+    if cuda_target not in jit_registry:
+        jit_registry[cuda_target] = jit
+    if cuda_target not in dispatcher_registry:
+        dispatcher_registry[cuda_target] = CUDADispatcher

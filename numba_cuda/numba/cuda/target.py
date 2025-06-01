@@ -137,11 +137,13 @@ class CUDATargetContext(BaseContext):
         from numba.np import arrayobj  # noqa: F401
         from numba.np import npdatetime  # noqa: F401
         from . import cudaimpl, printimpl, libdeviceimpl, mathimpl, vector_types
+        # from .coop import coopimpl  # noqa: F401
 
         # fix for #8940
         from numba.np.unsafe import ndarray  # noqa F401
 
         self.install_registry(cudaimpl.registry)
+        # self.install_registry(coopimpl.registry)
         self.install_registry(cffiimpl.registry)
         self.install_registry(printimpl.registry)
         self.install_registry(libdeviceimpl.registry)

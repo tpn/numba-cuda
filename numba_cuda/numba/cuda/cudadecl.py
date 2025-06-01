@@ -1,3 +1,4 @@
+from enum import IntEnum
 import operator
 from numba.core import errors, types
 from numba.core.typing.npydecl import (
@@ -736,9 +737,562 @@ class CudaFp16Template(AttributeTemplate):
         return types.Function(Cuda_hmin)
 
 
+# cuda.cooperative (block, warp)
+
+
+class BlockLoadAlgorithm(IntEnum):
+    DIRECT = 0
+    STRIPED = 1
+    VECTORIZE = 2
+    TRANSPOSE = 3
+    WARP_TRANSPOSE = 4
+    WARP_TRANSPOSE_TIMESLICED = 5
+
+
+class WarpLoadAlgorithm(IntEnum):
+    DIRECT = 0
+    STRIPED = 1
+    VECTORIZE = 2
+    TRANSPOSE = 3
+
+
+class BlockStoreAlgorithm(IntEnum):
+    DIRECT = 0
+    STRIPED = 1
+    VECTORIZE = 2
+    TRANSPOSE = 3
+    WARP_TRANSPOSE = 4
+    WARP_TRANSPOSE_TIMESLICED = 5
+
+
+class WarpStoreAlgorithm(IntEnum):
+    DIRECT = 0
+    STRIPED = 1
+    VECTORIZE = 2
+    TRANSPOSE = 3
+
+
+class BlockScanAlgorithm(IntEnum):
+    RAKING = 0
+    RAKING_MEMOIZE = 1
+    WARP_SCAN = 2
+
+
+class BlockReduceAlgorithm(IntEnum):
+    RAKING_COMMUTATIVE_ONLY = 0
+    RAKING = 1
+    WARP_REDUCTIONS = 2
+
+
+cuda.BlockLoadAlgorithm = BlockLoadAlgorithm
+cuda.WarpLoadAlgorithm = WarpLoadAlgorithm
+cuda.BlockStoreAlgorithm = BlockStoreAlgorithm
+cuda.WarpStoreAlgorithm = WarpStoreAlgorithm
+cuda.BlockScanAlgorithm = BlockScanAlgorithm
+cuda.BlockReduceAlgorithm = BlockReduceAlgorithm
+
+# Dummy sentinel used to detect missing arguments.
+_MISSING_SENTINEL = object()
+
+
+def _is_src_first(primitive_name):
+    return primitive_name.endswith(".load")
+
+
+def _bind_and_validate_src_dst(args, kwds, primitive_name):
+    """
+    Bind the user-supplied *src* and *dst* arguments (positional or keyword)
+    and validate that
+
+        * both are supplied and are device arrays,
+        * the same name is not provided twice (pos+kw),
+        * their dtype / ndim / layout agree (layout check is skipped if either
+          array has layout 'A' = any).
+
+    This function modifies args and kwds by removing consumed arguments.
+
+    Parameters
+    ----------
+    args : list
+        Positional arguments that reached the typer (will be modified).
+    kwds : dict
+        Keyword arguments that reached the typer (will be modified).
+    primitive_name : str
+        e.g. "cuda.block.load" – used only in diagnostics.
+
+    Returns
+    -------
+    (src_type, dst_type) : Tuple[numba.types.Array, numba.types.Array]
+        The Numba *types* for src and dst after binding.
+    """
+
+    # ------------------------------------------------------------------
+    # 1.  Detect whether this primitive is (src, dst) or (dst, src)
+    # ------------------------------------------------------------------
+    src_first = _is_src_first(primitive_name)
+
+    # Mapping of positional slots to names:
+    #   load : arg0→src , arg1→dst
+    #   store: arg0→dst , arg1→src
+    pos_names = ("src", "dst") if src_first else ("dst", "src")
+
+    # ------------------------------------------------------------------
+    # 2.  Check for duplicate specification (positional *and* keyword)
+    # ------------------------------------------------------------------
+    for idx, name in enumerate(pos_names):
+        if name in kwds and len(args) > idx:
+            raise errors.TypingError(
+                f"{primitive_name}: '{name}' specified both positionally "
+                "and as a keyword"
+            )
+
+    # ------------------------------------------------------------------
+    # 3.  Bind src / dst from args or kwds
+    # ------------------------------------------------------------------
+    src = None
+    dst = None
+
+    # Try to get from positional args first.
+    if src_first:
+        if len(args) >= 1:
+            src = args.pop(0)
+        if len(args) >= 1:
+            dst = args.pop(0)
+    else:  # store primitives
+        if len(args) >= 1:
+            dst = args.pop(0)
+        if len(args) >= 1:
+            src = args.pop(0)
+
+    # Get from keywords if not found in positional
+    if src is None and "src" in kwds:
+        src = kwds.pop("src")
+    if dst is None and "dst" in kwds:
+        dst = kwds.pop("dst")
+
+    # ------------------------------------------------------------------
+    # 4.  Presence check
+    # ------------------------------------------------------------------
+    if src is None or dst is None:
+        raise errors.TypingError(
+            f"{primitive_name} needs both 'src' and 'dst' arrays"
+        )
+
+    # ------------------------------------------------------------------
+    # 5.  Type and structural compatibility checks
+    # ------------------------------------------------------------------
+    if not isinstance(src, types.Array) or not isinstance(dst, types.Array):
+        raise errors.TypingError(
+            f"{primitive_name} requires both 'src' and 'dst' to be device "
+            "arrays"
+        )
+
+    # dtype
+    if src.dtype != dst.dtype:
+        raise errors.TypingError(
+            f"{primitive_name} requires 'src' and 'dst' to have the same "
+            f"dtype (got {src.dtype} vs {dst.dtype})"
+        )
+
+    # ndim
+    if src.ndim != dst.ndim:
+        raise errors.TypingError(
+            f"{primitive_name} requires 'src' and 'dst' to have the same "
+            f"number of dimensions (got {src.ndim} vs {dst.ndim})"
+        )
+
+    # layout – skip if either is 'A' (unknown/any)
+    if src.layout != "A" and dst.layout != "A" and src.layout != dst.layout:
+        raise errors.TypingError(
+            f"{primitive_name} requires 'src' and 'dst' to have the same "
+            f"layout (got {src.layout!r} vs {dst.layout!r})"
+        )
+
+    return (src, dst)
+
+
+def _as_pos_integer_literal_old2(val, name, primitive):
+    """If *val* is Integer(Literal) verify positivity and, if possible,
+    promote to IntegerLiteral to keep the information that it is a constant."""
+    if isinstance(val, types.IntegerLiteral):
+        if val.literal_value <= 0:
+            raise errors.TypingError(
+                f"'{name}' must be a positive integer; got {val.literal_value}"
+            )
+        # Normalize to intp instead of preserving the literal type
+        return types.intp
+
+    if isinstance(val, types.Integer):
+        # Compile-time constants sometimes arrive as plain Integer types
+        lit = getattr(val, "literal_value", None)
+        if lit is not None:  # we know the exact value
+            if lit <= 0:
+                raise errors.TypingError(
+                    f"'{name}' must be a positive integer; got {lit}"
+                )
+            # Normalize to intp instead of creating IntegerLiteral
+            return types.intp
+        # run-time scalar – positivity will be checked later in lowering
+        return val
+
+    # Anything else isn't an integer scalar
+    raise errors.TypingError(f"{primitive}: '{name}' must be an integer scalar")
+
+
+def _as_pos_integer_literal(val, name, primitive):
+    # IntegerLiteral ➜ keep as-is (after the >0 check)
+    if isinstance(val, types.IntegerLiteral):
+        if val.literal_value <= 0:
+            raise errors.TypingError(
+                f"'{name}' must be a positive integer; got {val.literal_value}"
+            )
+        return val
+
+    # Literal(int) ➜ keep as-is
+    if isinstance(val, types.Literal):
+        if isinstance(val.literal_value, int):
+            if val.literal_value <= 0:
+                raise errors.TypingError(
+                    f"'{name}' must be a positive integer; got {val.literal_value}"
+                )
+            return val
+
+    # Plain Integer ➜ keep as-is (positivity checked at run-time in lowering)
+    if isinstance(val, types.Integer):
+        return val
+
+    raise errors.TypingError(f"{primitive}: '{name}' must be an integer scalar")
+
+
+def _validate_positive_int_literal(
+    args, kwds, value, param_name: str, primitive_name: str
+):
+    """
+    Fetch *param_name* from the call, detect duplicates, require presence,
+    and return *exactly* the Numba type that was supplied (possibly promoted
+    to IntegerLiteral).
+    """
+    # 1. keyword beats positional duplicates
+    if param_name in kwds:
+        if value is not _MISSING_SENTINEL:
+            raise errors.TypingError(
+                f"{primitive_name}: '{param_name}' specified both "
+                "positionally and as a keyword"
+            )
+        value = kwds.pop(param_name)
+
+    # 2. still unset?  pop from *args*
+    if value is _MISSING_SENTINEL and args:
+        value = args.pop(0)
+
+    # 3. presence check
+    if value is _MISSING_SENTINEL:
+        raise errors.TypingError(f"{primitive_name} requires '{param_name}'")
+
+    # 4. type / sign check – and possible promotion to IntegerLiteral
+    return _as_pos_integer_literal(value, param_name, primitive_name)
+
+
+def _validate_positive_int_literal_old(
+    args,
+    kwds,
+    value,
+    param_name: str,
+    primitive_name: str,
+):
+    """
+    Fetch *param_name* from either *value* (positional), *args*, or *kwds*,
+    check that the user didn't supply it twice, and verify the type / sign.
+
+    On return:
+      * The corresponding entry is popped from *args* / *kwds*.
+      * The returned value is a Numba *type* that is a subtype of
+        `types.Integer` (possibly `types.IntegerLiteral`).
+    """
+    # 1.  Pull from keyword dict (and watch for duplicates)
+    if param_name in kwds:
+        if value is not _MISSING_SENTINEL:
+            raise errors.TypingError(
+                f"{primitive_name}: '{param_name}' specified both "
+                "positionally and as a keyword"
+            )
+        value = kwds.pop(param_name)
+
+    # 2.  Pull from positional list if still unset
+    if value is _MISSING_SENTINEL and args:
+        value = args.pop(0)
+
+    # 3.  Presence check
+    if value is _MISSING_SENTINEL:
+        raise errors.TypingError(f"{primitive_name} requires '{param_name}'")
+
+    # 4.  Type and positivity checks
+    if isinstance(value, types.IntegerLiteral):
+        if value.literal_value <= 0:
+            raise errors.TypingError(
+                f"'{param_name}' must be a positive integer; "
+                f"got {value.literal_value}"
+            )
+        return value  # literal, keep as-is
+
+    if isinstance(value, types.Literal):
+        pyval = value.literal_value
+        if isinstance(pyval, int):
+            if pyval <= 0:
+                raise errors.TypingError(
+                    f"'{param_name}' must be a positive integer; got {pyval}"
+                )
+            return types.IntegerLiteral(pyval)
+
+    if not isinstance(value, types.Integer):
+        raise errors.TypingError(
+            f"{primitive_name}: '{param_name}' must be an integer scalar"
+        )
+
+    # If the integer happens to have a literal_value attribute (compile-time
+    # constant folded by Numba), check its sign and turn it into a literal
+    # type – this lets constant-propagation hit the fast path.
+    if hasattr(value, "literal_value"):
+        lit = value.literal_value
+        if lit <= 0:
+            raise errors.TypingError(
+                f"'{param_name}' must be a positive integer; got {lit}"
+            )
+        return types.IntegerLiteral(lit)
+
+    # Generic integer (run-time value) – handed off to lowering for the final
+    # constant-ness check.
+    return types.intp
+
+
+def _validate_threads_per_block(args, kwds, current, primitive_name: str):
+    return _validate_positive_int_literal(
+        args, kwds, current, "threads_per_block", primitive_name
+    )
+
+
+def _validate_items_per_thread(args, kwds, current, primitive_name: str):
+    return _validate_positive_int_literal(
+        args, kwds, current, "items_per_thread", primitive_name
+    )
+
+
+def _validate_algorithm(args, kwds, algorithm, primitive_name: str, enum_cls):
+    """
+    Make sure *algorithm* is a literal belonging to the given enum class.
+
+    This function modifies args and kwds by removing consumed arguments.
+
+    Returns the validated algorithm value.
+    """
+    original_algorithm = algorithm
+
+    # Check if algorithm is in kwds
+    if "algorithm" in kwds:
+        if algorithm is not _MISSING_SENTINEL:
+            raise errors.TypingError(
+                f"{primitive_name}: 'algorithm' specified both positionally "
+                "and as a keyword"
+            )
+        algorithm = kwds.pop("algorithm")
+
+    # If still missing and we have positional args, try to get from there
+    if algorithm is _MISSING_SENTINEL:
+        if args:
+            algorithm = args.pop(0)
+        else:
+            # If no algorithm was specified, use the default
+            return None
+
+    enum_name = enum_cls.__name__
+    user_facing_name = f"cuda.{enum_name}"
+
+    if not isinstance(algorithm, types.EnumMember):
+        msg = (
+            f"algorithm for {primitive_name} must be a member "
+            f"of {user_facing_name}, got {original_algorithm}"
+        )
+        raise errors.TypingError(msg)
+
+    if algorithm.instance_class is not enum_cls:
+        name = algorithm.instance_class.__name__
+        msg = (
+            f"algorithm for {primitive_name} must be a member "
+            f"of {user_facing_name}, got {name} "
+        )
+        raise errors.TypingError(msg)
+
+    return algorithm
+
+
+class Coop_load_store_decl(CallableTemplate):
+    """
+    Base class for all cooperative load and store functions.  Subclasses must
+    define the following attributes:
+      - key: the function name (e.g. cuda.block.load)
+      - primitive_name: the name of the primitive (e.g. "cuda.block.load")
+      - algorithm_enum: the enum class for the algorithm (e.g.
+        BlockLoadAlgorithm)
+      - default_algorithm: the default algorithm to use if not specified
+    """
+
+    def generic(self):
+        print(f"Entered generic for {self.key}, {self.primitive_name}")
+
+        def typer(
+            *args,
+            threads_per_block=_MISSING_SENTINEL,
+            items_per_thread=_MISSING_SENTINEL,
+            algorithm=_MISSING_SENTINEL,
+            **kwds,
+        ):
+            # Convert args to a mutable list and make a copy of kwds
+            args = list(args)
+            kwds = dict(kwds)
+
+            (src, dst) = _bind_and_validate_src_dst(
+                args, kwds, self.primitive_name
+            )
+
+            threads_per_block = _validate_threads_per_block(
+                args,
+                kwds,
+                threads_per_block,
+                self.primitive_name,
+            )
+
+            items_per_thread = _validate_items_per_thread(
+                args,
+                kwds,
+                items_per_thread,
+                self.primitive_name,
+            )
+
+            algorithm = _validate_algorithm(
+                args,
+                kwds,
+                algorithm,
+                self.primitive_name,
+                self.algorithm_enum,
+            )
+
+            # If args or kwds still have values, the user has passed extra
+            # arguments that we don't support.
+            if args:
+                raise errors.TypingError(
+                    f"{self.primitive_name} does not support additional "
+                    f"positional arguments: {', '.join(map(str, args))}"
+                )
+            if kwds:
+                names = ", ".join(kwds.keys())
+                raise errors.TypingError(
+                    f"{self.primitive_name} does not support additional "
+                    f"keyword arguments: {names}"
+                )
+
+            if _is_src_first(self.primitive_name):
+                array_args = (src, dst)
+            else:
+                array_args = (dst, src)
+
+            arglist = [
+                *array_args,
+                threads_per_block,
+                items_per_thread,
+            ]
+
+            if algorithm is not None:
+                arglist.append(algorithm)
+            else:
+                arglist.append(self.default_algorithm.value)
+
+            return types.VarArg(types.Any)
+
+            # Doesn't work:
+            return signature(types.void, types.VarArg(types.Any))
+
+            # Doesn't work:
+            return signature(
+                types.void,
+                *arglist,
+            )
+
+        return typer
+
+
+@register
+class Coop_block_load(Coop_load_store_decl):
+    key = cuda.block.load
+    primitive_name = "cuda.block.load"
+    algorithm_enum = BlockLoadAlgorithm
+    default_algorithm = BlockLoadAlgorithm.DIRECT
+
+
+@register
+class Coop_warp_load(Coop_load_store_decl):
+    key = cuda.warp.load
+    primitive_name = "cuda.warp.load"
+    algorithm_enum = WarpLoadAlgorithm
+    default_algorithm = WarpLoadAlgorithm.DIRECT
+
+
+@register
+class Coop_block_store(Coop_load_store_decl):
+    key = cuda.block.store
+    primitive_name = "cuda.block.store"
+    algorithm_enum = BlockStoreAlgorithm
+    default_algorithm = BlockStoreAlgorithm.DIRECT
+
+
+@register
+class Coop_warp_store(Coop_load_store_decl):
+    key = cuda.warp.store
+    primitive_name = "cuda.warp.store"
+    algorithm_enum = WarpStoreAlgorithm
+    default_algorithm = WarpStoreAlgorithm.DIRECT
+
+
+@register_attr
+class CudaBlockModuleTemplate(AttributeTemplate):
+    key = types.Module(cuda.block)
+
+    def resolve_load(self, mod):
+        return types.Function(Coop_block_load)
+
+    def resolve_store(self, mod):
+        return types.Function(Coop_block_store)
+
+
+@register_attr
+class CudaWarpModuleTemplate(AttributeTemplate):
+    key = types.Module(cuda.warp)
+
+    def resolve_load(self, mod):
+        return types.Function(Coop_warp_load)
+
+    def resolve_store(self, mod):
+        return types.Function(Coop_warp_store)
+
+
 @register_attr
 class CudaModuleTemplate(AttributeTemplate):
     key = types.Module(cuda)
+
+    # cuda.cooperative: begin
+
+    def resolve_block(self, mod):
+        return types.Module(cuda.block)
+
+    def resolve_warp(self, mod):
+        return types.Module(cuda.warp)
+
+    def resolve_BlockLoadAlgorithm(self, mod):
+        return types.Module(BlockLoadAlgorithm)
+
+    def resolve_BlockStoreAlgorithm(self, mod):
+        return types.Module(BlockStoreAlgorithm)
+
+    # cuda.cooperative: end
 
     def resolve_cg(self, mod):
         return types.Module(cuda.cg)

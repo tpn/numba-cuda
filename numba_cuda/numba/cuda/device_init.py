@@ -31,6 +31,8 @@ from .stubs import (
     nanosleep,
     fp16,
     _vector_type_stubs,
+    block,
+    warp,
 )
 from .intrinsics import (
     grid,

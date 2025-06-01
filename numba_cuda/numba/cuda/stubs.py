@@ -938,3 +938,66 @@ def map_vector_type_stubs_to_alias(vector_type_stubs):
 
 _vector_type_stubs = make_vector_type_stubs()
 map_vector_type_stubs_to_alias(_vector_type_stubs)
+
+# -------------------------------------------------------------------------------
+# cuda.cooperative primitives (block, warp)
+
+
+class block(Stub):
+    """
+    Block namespace.
+    """
+
+    @stub_function
+    def load(
+        src,
+        dst,
+        threads_per_block,
+        items_per_thread,
+        algorithm,
+    ):
+        """
+        Load data from global memory.
+        """
+
+    @stub_function
+    def store(
+        src,
+        dst,
+        threads_per_block,
+        items_per_thread,
+        algorithm,
+    ):
+        """
+        Store data to global memory.
+        """
+
+
+class warp(Stub):
+    """
+    Block namespace.
+    """
+
+    @stub_function
+    def load(
+        src,
+        dst,
+        threads_per_block,
+        items_per_thread: int,
+        algorithm,
+    ):
+        """
+        Load data from global memory.
+        """
+
+    @stub_function
+    def store(
+        src,
+        dst,
+        threads_per_block,
+        items_per_thread: int,
+        algorithm,
+    ):
+        """
+        Store data to global memory.
+        """
