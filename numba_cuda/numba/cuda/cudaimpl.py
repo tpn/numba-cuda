@@ -1232,44 +1232,63 @@ def lower_block_load(context, builder, sig, args):
     # import ipdb
     # ipdb.set_trace()
 
-    print("LOWER BLOCK LOAD ARRIVED!")
-    src_ty, dst_ty, tpblock_ty, items_ty, algo_ty = sig.args
-    src_val, dst_val, tpblock_val, items_val, algo_val = args
+    from .cudadecl import Coop_block_load
 
-    # ------------------------------------------------------------------
-    # 1.  Recover the *compile-time* literal values
-    # ------------------------------------------------------------------
-    n_threads = tpblock_ty.literal_value  # python int
-    n_items = items_ty.literal_value  # python int
-    # algo_id = algo_ty.literal_value  # 0..5 for your BlockLoadAlgorithm
+    if len(args) == 4:
+        algorithm = Coop_block_load.default_algorithm.value
+        (src_ty, dst_ty, threads_per_block_ty, items_per_thread_ty) = sig.args
+        (src, dst, threads_per_block, items_per_thread) = args
+    else:
+        (src_ty, dst_ty, threads_per_block_ty, items_per_thread_ty, algo_ty) = (
+            sig.args
+        )
+        (src, dst, threads_per_block, items_per_thread, algorithm) = args
 
-    # Optional: run-time asserts (useful while prototyping)
-    assert n_threads > 0 and n_items > 0
+    print("ENTERED cuda.block.load LOWERING")
 
-    print("LOWER BLOCK LOAD ARRIVED!")
+    # Print all the types.
+    print(
+        f"src_ty: {src_ty}, dst_ty: {dst_ty}, "
+        f"threads_per_block_ty: {threads_per_block_ty}, "
+        f"items_per_thread_ty: {items_per_thread_ty}"
+    )
+    # Print all the values.
+    print(
+        f"src: {src}, dst: {dst}, "
+        f"threads_per_block: {threads_per_block}, "
+        f"items_per_thread: {items_per_thread}, "
+        f"algorithm: {algorithm}"
+    )
+    print(f"ENTER LOWER BLOCK LOAD: {algorithm}")
 
 
-# @lower(cuda.block.store, *LOAD_STORE_SIGNATURE1)
-# @lower(cuda.block.store, *LOAD_STORE_SIGNATURE2)
-
-
-@lower(cuda.block.load, types.VarArg(types.Any))
+@lower(cuda.block.store, types.VarArg(types.Any))
 def lower_block_store(context, builder, sig, args):
-    # import ipdb
-    # ipdb.set_trace()
+    from .cudadecl import Coop_block_store
 
-    print("LOWER BLOCK STORE ARRIVED!")
-    src_ty, dst_ty, tpblock_ty, items_ty, algo_ty = sig.args
-    src_val, dst_val, tpblock_val, items_val, algo_val = args
+    if len(args) == 4:
+        algorithm = Coop_block_store.default_algorithm.value
+        (src_ty, dst_ty, threads_per_block_ty, items_per_thread_ty) = sig.args
+        (src, dst, threads_per_block, items_per_thread) = args
+    else:
+        (src_ty, dst_ty, threads_per_block_ty, items_per_thread_ty, algo_ty) = (
+            sig.args
+        )
+        (src, dst, threads_per_block, items_per_thread, algorithm) = args
 
-    # ------------------------------------------------------------------
-    # 1.  Recover the *compile-time* literal values
-    # ------------------------------------------------------------------
-    n_threads = tpblock_ty.literal_value  # python int
-    n_items = items_ty.literal_value  # python int
-    # algo_id = algo_ty.literal_value  # 0..5 for your BlockStoreAlgorithm
+    print("ENTER cuda.block.store LOWERING")
 
-    # Optional: run-time asserts (useful while prototyping)
-    assert n_threads > 0 and n_items > 0
+    # Print all the types.
+    print(
+        f"src_ty: {src_ty}, dst_ty: {dst_ty}, "
+        f"threads_per_block_ty: {threads_per_block_ty}, "
+        f"items_per_thread_ty: {items_per_thread_ty}"
+    )
 
-    print("LOWER BLOCK STORE ARRIVED!")
+    # Print all the values.
+    print(
+        f"src: {src}, dst: {dst}, "
+        f"threads_per_block: {threads_per_block}, "
+        f"items_per_thread: {items_per_thread}, "
+        f"algorithm: {algorithm}"
+    )
