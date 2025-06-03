@@ -1,3 +1,4 @@
+import inspect
 from functools import reduce
 import operator
 import math
@@ -9,7 +10,7 @@ import llvmlite.binding as ll
 from numba.core.imputils import Registry, lower_cast
 from numba.core.typing.npydecl import parse_dtype
 from numba.core.datamodel import models
-from numba.core import types, cgutils
+from numba.core import ir_utils, types, cgutils
 from numba.np import ufunc_db
 from numba.np.npyimpl import register_ufuncs
 from .cudadrv import nvvm
@@ -1174,121 +1175,3 @@ def cuda_dispatcher_const(context, builder, ty, pyval):
 # NumPy
 
 register_ufuncs(ufunc_db.get_ufuncs(), lower)
-
-# cuda.cooperative
-
-
-@lower_attr(types.Module(cuda), "BlockLoadAlgorithm")
-def lower_block_load_algorithm(context, builder, typ, val):
-    """
-    Lower the BlockLoadAlgorithm enum to a constant value.
-    """
-    if isinstance(val, types.EnumMember):
-        # This is a compile-time constant
-        return context.get_constant(types.int32, val.value)
-    else:
-        # This is a run-time value, we cannot lower it
-        raise errors.ConstantInferenceError(
-            "BlockLoadAlgorithm must be a compile-time constant"
-        )
-
-
-@lower_attr(types.Module(cuda), "BlockStoreAlgorithm")
-def lower_block_store_algorithm(context, builder, typ, val):
-    """
-    Lower the BlockStoreAlgorithm enum to a constant value.
-    """
-    if isinstance(val, types.EnumMember):
-        # This is a compile-time constant
-        return context.get_constant(types.int32, val.value)
-    else:
-        # This is a run-time value, we cannot lower it
-        raise errors.ConstantInferenceError(
-            "BlockStoreAlgorithm must be a compile-time constant"
-        )
-
-
-LOAD_STORE_SIGNATURE1 = (
-    types.Array,  # src or dst
-    types.Array,  # dst or src
-    types.Integer,  # threads_per_block
-    types.Integer,  # items_per_thread
-)
-
-LOAD_STORE_SIGNATURE2 = (
-    types.Array,  # src or dst
-    types.Array,  # dst or src
-    types.Integer,  # threads_per_block
-    types.Integer,  # items_per_thread
-    types.EnumMember,  # algorithm
-)
-
-# @lower(cuda.block.load, *LOAD_STORE_SIGNATURE1)
-# @lower(cuda.block.load, *LOAD_STORE_SIGNATURE2)
-
-
-@lower(cuda.block.load, types.VarArg(types.Any))
-def lower_block_load(context, builder, sig, args):
-    # import ipdb
-    # ipdb.set_trace()
-
-    from .cudadecl import Coop_block_load
-
-    if len(args) == 4:
-        algorithm = Coop_block_load.default_algorithm.value
-        (src_ty, dst_ty, threads_per_block_ty, items_per_thread_ty) = sig.args
-        (src, dst, threads_per_block, items_per_thread) = args
-    else:
-        (src_ty, dst_ty, threads_per_block_ty, items_per_thread_ty, algo_ty) = (
-            sig.args
-        )
-        (src, dst, threads_per_block, items_per_thread, algorithm) = args
-
-    print("ENTERED cuda.block.load LOWERING")
-
-    # Print all the types.
-    print(
-        f"src_ty: {src_ty}, dst_ty: {dst_ty}, "
-        f"threads_per_block_ty: {threads_per_block_ty}, "
-        f"items_per_thread_ty: {items_per_thread_ty}"
-    )
-    # Print all the values.
-    print(
-        f"src: {src}, dst: {dst}, "
-        f"threads_per_block: {threads_per_block}, "
-        f"items_per_thread: {items_per_thread}, "
-        f"algorithm: {algorithm}"
-    )
-    print(f"ENTER LOWER BLOCK LOAD: {algorithm}")
-
-
-@lower(cuda.block.store, types.VarArg(types.Any))
-def lower_block_store(context, builder, sig, args):
-    from .cudadecl import Coop_block_store
-
-    if len(args) == 4:
-        algorithm = Coop_block_store.default_algorithm.value
-        (src_ty, dst_ty, threads_per_block_ty, items_per_thread_ty) = sig.args
-        (src, dst, threads_per_block, items_per_thread) = args
-    else:
-        (src_ty, dst_ty, threads_per_block_ty, items_per_thread_ty, algo_ty) = (
-            sig.args
-        )
-        (src, dst, threads_per_block, items_per_thread, algorithm) = args
-
-    print("ENTER cuda.block.store LOWERING")
-
-    # Print all the types.
-    print(
-        f"src_ty: {src_ty}, dst_ty: {dst_ty}, "
-        f"threads_per_block_ty: {threads_per_block_ty}, "
-        f"items_per_thread_ty: {items_per_thread_ty}"
-    )
-
-    # Print all the values.
-    print(
-        f"src: {src}, dst: {dst}, "
-        f"threads_per_block: {threads_per_block}, "
-        f"items_per_thread: {items_per_thread}, "
-        f"algorithm: {algorithm}"
-    )

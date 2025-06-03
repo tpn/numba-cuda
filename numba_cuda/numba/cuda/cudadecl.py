@@ -784,6 +784,9 @@ class BlockReduceAlgorithm(IntEnum):
     RAKING = 1
     WARP_REDUCTIONS = 2
 
+class ScanMode(IntEnum):
+    EXCLUSIVE = 0
+    INCLUSIVE = 1
 
 cuda.BlockLoadAlgorithm = BlockLoadAlgorithm
 cuda.WarpLoadAlgorithm = WarpLoadAlgorithm

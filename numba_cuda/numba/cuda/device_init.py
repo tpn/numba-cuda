@@ -87,6 +87,8 @@ from numba.cuda.cudadrv.linkable_code import (
     PTXSource,
 )
 
+from .coop import rewrite
+
 reduce = Reduce = reduction.Reduce
 
 # Expose vector type constructors and aliases as module level attributes.
