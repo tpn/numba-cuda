@@ -772,7 +772,7 @@ class WarpStoreAlgorithm(IntEnum):
     VECTORIZE = 2
     TRANSPOSE = 3
 
-
+#
 class BlockScanAlgorithm(IntEnum):
     RAKING = 0
     RAKING_MEMOIZE = 1

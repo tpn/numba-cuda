@@ -653,8 +653,7 @@ class Algorithm:
     def temp_storage_alignment(self):
         return self._temp_storage_bytes_and_alignment[1]
 
-    def get_lto_ir(self, threads=None):
-        lto_irs = []
+    def generate_source(self, threads=None):
 
         if self.type_definitions:
             for type_definition in self.type_definitions:
@@ -671,8 +670,10 @@ class Algorithm:
                         udf_declarations[param.name] = param.forward_decl()
                         lto_irs.append(param.ltoir)
 
+        self.udf_declarations = udf_declarations
+
         environment = jinja2.Environment()
-        template = environment.from_string("""
+        template = environment.from_string(dedent("""\
             #include <cuda/std/cstdint>
 
             {% for include in includes %}
@@ -691,7 +692,7 @@ class Algorithm:
 
             using algorithm_t = cub::{{ algorithm_name }};
             using temp_storage_t = typename algorithm_t::TempStorage;
-            """)
+            """))
         src = template.render(
             algorithm_name=self.struct_name,
             includes=self.includes,
@@ -742,7 +743,7 @@ class Algorithm:
                 storage = "__shared__ temp_storage_t temp_storage;"
                 sync = "__syncthreads();"
 
-            template = environment.from_string("""
+            template = environment.from_string(dedent("""\
                 {% if provide_alloc_version %}
                 extern "C" __device__ void {{ mangled_name }}_alloc({{ param_decls }})
                 {
@@ -774,7 +775,7 @@ class Algorithm:
 
                    algorithm_t(*temp_storage).{{ method_name }}({{ param_args }});
                 }
-                """)
+                """))
             src += template.render(
                 param_decls=", ".join(param_decls),
                 param_args=", ".join(param_args),
@@ -787,13 +788,24 @@ class Algorithm:
                 provide_alloc_version=provide_alloc_version,
             )
 
+        self.source_code = src
+
+    def get_lto_ir(self, threads=None):
+        lto_irs = []
+
+        self.generate_source(threads)
+
         device = cuda.get_current_device()
         cc_major, cc_minor = device.compute_capability
         cc = cc_major * 10 + cc_minor
-        # N.B. Uncomment this to immediately print generated source to stdout.
-        # print(src)
-        _, lto_fn = nvrtc.compile(cpp=src, cc=cc, rdc=True, code="lto")
+        _, lto_fn = nvrtc.compile(
+            cpp=self.source_src,
+            cc=cc,
+            rdc=True,
+            code="lto",
+        )
         lto_irs.append(lto_fn)
+        self.lto_irs = lto_irs
         return lto_irs
 
     def codegen(self, func_to_overload):
@@ -906,26 +918,28 @@ class Algorithm:
 
             return signature(ret, *params), codegen
 
-        num_user_provided_params = sum(
+        self.num_user_provided_params = sum(
             [param.is_provided_by_user() for param in method]
         )
-        numba_intrinsic = intrinsic(
+        self.numba_intrinsic = intrinsic(
             war_introspection(intrinsic_impl, 1 + num_user_provided_params)
         )
 
         def algorithm_impl(*args):
             return war_introspection(numba_intrinsic, len(args))
 
-        wrapped_algorithm_impl = war_introspection(
+        self.wrapped_algorithm_impl = war_introspection(
             algorithm_impl, num_user_provided_params
         )
-        overload(func_to_overload, target="cuda")(wrapped_algorithm_impl)
+        overload(func_to_overload, target="cuda")(self.wrapped_algorithm_impl)
 
 
 class Invocable:
-    key = None
 
-    def __init__(
+    def __init__(self):
+        self.lowered = False
+
+    def lower(
         self,
         temp_files: Sequence[BinaryIO],
         temp_storage_bytes: int,
@@ -936,18 +950,22 @@ class Invocable:
         self._temp_storage_bytes = temp_storage_bytes
         self._temp_storage_alignment = temp_storage_alignment
         algorithm.codegen(self)
-        self.key = algorithm.c_name
 
     @property
     def temp_storage_bytes(self):
+        msg = "Cannot access temp_storage_bytes before lowering."
+        assert self.lowered, msg
         return self._temp_storage_bytes
 
     @property
     def temp_storage_alignment(self):
+        msg = "Cannot access temp_storage_alignment before lowering."
+        assert self.lowered, msg
         return self._temp_storage_alignment
 
     @property
     def files(self):
+        assert self.lowered, "Cannot access files before lowering."
         return [v.name for v in self._temp_files]
 
     def __call__(self, *args):

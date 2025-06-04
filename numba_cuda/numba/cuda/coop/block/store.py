@@ -2,9 +2,13 @@
 #
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
+from enum import IntEnum
+from functools import cached_property
+
 import numba
 from numba import cuda
-from enum import IntEnum
+from numba.core.typing import signature
+from numba.core import types
 
 from .._common import (
     make_binary_tempfile,
@@ -53,11 +57,32 @@ class store:
     c_name = "block_store"
     includes = ["cub/block/block_store.cuh"]
 
-    def __init__(self, dtype, dim, items_per_thread=1, algorithm="direct"):
+    @staticmethod
+    def _typer_implicit_temp_storage(src, dst):
+        return signature(
+            types.none,
+            args=(src, dst),
+            recvr=None,
+            pysig=None,
+        )
+
+    @staticmethod
+    def _typer_explicit_temp_storage(temp_storage, src, dst):
+        return signature(
+            types.none,
+            args=(src, dst, temp_storage),
+            recvr=None,
+            pysig=None,
+        )
+
+
+    def __init__(self, dtype, dim, items_per_thread, algorithm):
         self.dtype = normalize_dtype_param(dtype)
         self.dim = normalize_dim_param(dim)
         self.items_per_thread = items_per_thread
-        self.algorithm = algorithm
+        if algorithm is None:
+            algorithm = self.default_algorithm
+        self.algorithm_enum = algorithm
 
         self.template_parameters = [
             TemplateParameter("T"),
@@ -76,7 +101,7 @@ class store:
             ]
         ]
 
-        self.template = Algorithm(
+        self.algorithm = Algorithm(
             self.struct_name,
             self.method_name,
             self.c_name,
@@ -85,19 +110,21 @@ class store:
             self.parameters,
         )
 
-        self.specialization = self.template.specialize(
+        self.specialization = self.algorithm.specialize(
             {
                 "T": self.dtype,
                 "BLOCK_DIM_X": self.dim[0],
                 "ITEMS_PER_THREAD": items_per_thread,
-                "ALGORITHM": CUB_BLOCK_STORE_ALGOS[algorithm],
+                "ALGORITHM": CUB_BLOCK_STORE_ALGOS[self.algorithm_enum],
                 "BLOCK_DIM_Y": self.dim[1],
                 "BLOCK_DIM_Z": self.dim[2],
             }
         )
 
-        self.temp_storage_bytes = self.specialization.temp_storage_bytes
-        self.temp_storage_alignment = self.specialization.temp_storage_alignment
+        #self.temp_storage_bytes = self.specialization.temp_storage_bytes
+        #self.temp_storage_alignment = self.specialization.temp_storage_alignment
+
+        return
 
         self.temp_files = [
             make_binary_tempfile(ltoir, ".ltoir")
@@ -110,3 +137,22 @@ class store:
             temp_storage_alignment=self.temp_storage_alignment,
             algorithm=self.specialization,
         )
+
+    @property
+    def temp_storage_bytes(self):
+        return self.specialization.temp_storage_bytes
+
+    @property
+    def temp_storage_alignment(self):
+        return self.specialization.temp_storage_alignment
+
+    @cached_property
+    def temp_files(self):
+        return [
+            make_binary_tempfile(ltoir, ".ltoir")
+            for ltoir in self.specialization.get_lto_ir()
+        ]
+
+    @cached_property
+    def invocable(self):
+        return Invocable()
