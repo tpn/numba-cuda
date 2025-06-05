@@ -26,6 +26,9 @@ from .._types import (
     TemplateParameter,
 )
 
+from .._base import BasePrimitive
+
+
 class BlockLoadAlgorithm(IntEnum):
     DIRECT = 0
     STRIPED = 1
@@ -50,7 +53,7 @@ CUB_BLOCK_LOAD_ALGOS = {
     #cuda.BlockLoadAlgorithm.WARP_TRANSPOSE_TIMESLICED: "::cub::BLOCK_LOAD_WARP_TRANSPOSE_TIMESLICED",
 }
 
-class load:
+class load(BasePrimitive):
     default_algorithm = BlockLoadAlgorithm.DIRECT
     struct_name = "BlockLoad"
     method_name = "Load"

@@ -10,6 +10,8 @@ from numba import cuda
 from numba.core.typing import signature
 from numba.core import types
 
+from .._base import BasePrimitive
+
 from .._common import (
     make_binary_tempfile,
     normalize_dim_param,
@@ -50,7 +52,7 @@ CUB_BLOCK_STORE_ALGOS = {
     int(BlockStoreAlgorithm.WARP_TRANSPOSE_TIMESLICED): "::cub::BLOCK_STORE_WARP_TRANSPOSE_TIMESLICED",
 }
 
-class store:
+class store(BasePrimitive):
     default_algorithm = BlockStoreAlgorithm.DIRECT
     struct_name = "BlockStore"
     method_name = "Store"
@@ -121,38 +123,4 @@ class store:
             }
         )
 
-        #self.temp_storage_bytes = self.specialization.temp_storage_bytes
-        #self.temp_storage_alignment = self.specialization.temp_storage_alignment
-
         return
-
-        self.temp_files = [
-            make_binary_tempfile(ltoir, ".ltoir")
-            for ltoir in self.specialization.get_lto_ir()
-        ]
-
-        self.invocable = Invocable(
-            temp_files=self.temp_files,
-            temp_storage_bytes=self.temp_storage_bytes,
-            temp_storage_alignment=self.temp_storage_alignment,
-            algorithm=self.specialization,
-        )
-
-    @property
-    def temp_storage_bytes(self):
-        return self.specialization.temp_storage_bytes
-
-    @property
-    def temp_storage_alignment(self):
-        return self.specialization.temp_storage_alignment
-
-    @cached_property
-    def temp_files(self):
-        return [
-            make_binary_tempfile(ltoir, ".ltoir")
-            for ltoir in self.specialization.get_lto_ir()
-        ]
-
-    @cached_property
-    def invocable(self):
-        return Invocable()

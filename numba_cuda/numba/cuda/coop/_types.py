@@ -5,7 +5,7 @@
 import re
 from functools import cached_property
 from textwrap import dedent
-from types import FunctionType as PyFunctionType
+from types import FunctionType as PyFunctionType, SimpleNamespace
 from typing import BinaryIO, Literal, Sequence
 
 import jinja2
@@ -529,6 +529,8 @@ def mangle_symbol(name, template_parameters):
 
 
 def war_introspection(fn, n):
+    from textwrap import dedent
+    from types import FunctionType as PyFunctionType
     arglist = ", ".join(f"param{i}" for i in range(n))
     mod_str = dedent(f"""
     def impl({arglist}):
@@ -559,6 +561,11 @@ class Algorithm:
         self.parameters = parameters
         self.type_definitions = type_definitions
         self.fake_return = fake_return
+        self.mangled_names = []
+        self.mangled_names_alloc = []
+        # Keyed by (tuple(Parameters), mangled_name)
+        self._codegen = {}
+        self.source_code = None
 
     def __repr__(self) -> str:
         return f"{self.struct_name}::{self.method_name}{self.template_parameters}: {self.parameters}"
@@ -654,6 +661,8 @@ class Algorithm:
         return self._temp_storage_bytes_and_alignment[1]
 
     def generate_source(self, threads=None):
+        if self.source_code is not None:
+            return
 
         if self.type_definitions:
             for type_definition in self.type_definitions:
@@ -743,6 +752,19 @@ class Algorithm:
                 storage = "__shared__ temp_storage_t temp_storage;"
                 sync = "__syncthreads();"
 
+            param_decls = ', '.join(param_decls)
+            param_args = ', '.join(param_args)
+            mangled_name = f'{self.mangled_name(method)}'
+            self.mangled_names.append(mangled_name)
+
+            if provide_alloc_version:
+                # If we provide an alloc version, we need to generate a separate
+                # function that allocates the temporary storage and calls the
+                # main algorithm method.
+                mangled_name_alloc = f'{mangled_name}_alloc'
+                self.mangled_names_alloc.append(mangled_name_alloc)
+
+
             template = environment.from_string(dedent("""\
                 {% if provide_alloc_version %}
                 extern "C" __device__ void {{ mangled_name }}_alloc({{ param_decls }})
@@ -777,8 +799,8 @@ class Algorithm:
                 }
                 """))
             src += template.render(
-                param_decls=", ".join(param_decls),
-                param_args=", ".join(param_args),
+                param_decls=param_decls,
+                param_args=param_args,
                 func_decls=func_decls,
                 out_param=out_param,
                 method_name=self.method_name,
@@ -799,7 +821,7 @@ class Algorithm:
         cc_major, cc_minor = device.compute_capability
         cc = cc_major * 10 + cc_minor
         _, lto_fn = nvrtc.compile(
-            cpp=self.source_src,
+            cpp=self.source_code,
             cc=cc,
             rdc=True,
             code="lto",
@@ -808,17 +830,44 @@ class Algorithm:
         self.lto_irs = lto_irs
         return lto_irs
 
-    def codegen(self, func_to_overload):
+    def codegen(self, parameters=None):
         if len(self.template_parameters):
             raise ValueError("Cannot generate codegen for a template")
 
-        for method in self.parameters:
-            self.codegen_method(func_to_overload, method, self.mangled_name(method))
-            self.codegen_method(
-                func_to_overload, method[1:], self.mangled_name(method) + "_alloc"
+        results = []
+
+        if parameters is None:
+            parameters = self.parameters
+        else:
+            if not isiterable(parameters):
+                parameters = [parameters]
+            # Ensure all parameters are ones we know about.
+            given_parameters = set(tuple(p) for p in parameters)
+            known_parameters = set(tuple(p) for p in self.parameters)
+            if not given_parameters.issubset(known_parameters):
+                raise ValueError(
+                    "Given parameters do not match known parameters: "
+                    f"{given_parameters - known_parameters}"
+                )
+
+        for method in parameters:
+            mangled_name = self.mangled_name(method)
+            results.append(
+                self.codegen_method(
+                    method,
+                    mangled_name,
+                )
+            )
+            results.append(
+                self.codegen_method(
+                    method[1:],
+                    mangled_name + "_alloc"
+                )
             )
 
-    def codegen_method(self, func_to_overload, method, mangled_name):
+        return results
+
+    def codegen_method(self, method, mangled_name):
         if len(self.template_parameters):
             raise ValueError("Cannot generate codegen for a template")
 
@@ -918,20 +967,34 @@ class Algorithm:
 
             return signature(ret, *params), codegen
 
-        self.num_user_provided_params = sum(
+        num_user_provided_params = sum(
             [param.is_provided_by_user() for param in method]
         )
-        self.numba_intrinsic = intrinsic(
+        numba_intrinsic = intrinsic(
             war_introspection(intrinsic_impl, 1 + num_user_provided_params)
         )
 
         def algorithm_impl(*args):
             return war_introspection(numba_intrinsic, len(args))
 
-        self.wrapped_algorithm_impl = war_introspection(
+        wrapped_algorithm_impl = war_introspection(
             algorithm_impl, num_user_provided_params
         )
-        overload(func_to_overload, target="cuda")(self.wrapped_algorithm_impl)
+
+        cg = SimpleNamespace(
+            intrinsic_impl=intrinsic_impl,
+            numba_intrinsic=numba_intrinsic,
+            algorithm_impl=algorithm_impl,
+            wrapped_algorithm_impl=wrapped_algorithm_impl,
+        )
+
+        return cg
+
+    def do_overload(self, cg):
+        overload(
+            func_to_overload,
+            target="cuda")
+        (cg.wrapped_algorithm_impl)
 
 
 class Invocable:

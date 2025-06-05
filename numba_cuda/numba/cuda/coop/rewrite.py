@@ -47,11 +47,22 @@ class Primitive(IntEnum):
     SCAN = 2
     REDUCE = 3
 
-
 @dataclass
 class CoopStmt:
+    """
+    Hacky Swiss Army knife class for capturing everything I can possibly think
+    of that might be needed to rewrite a cooperative operation call.  Will
+    absolutely be refactored later, but for now it is a convenient way to
+    capture all the necessary information in one place, even if redundant or
+    unnecessary.
+
+    At it's core, it represents the IR node corresponding to a single-phase
+    cuda.cooperative call, e.g. `cuda.block.load()`.
+    """
+
     index: int
     block_line: int
+    state: types.Any
     expr: ir.Expr
     instr: ir.Assign
     template: types.Any
@@ -64,12 +75,16 @@ class CoopStmt:
     # Defaults.
     implicit_temp_storage: bool = True
 
+    # Optional.
+    threads: int = None
+
     # Provided after the fact by the rewrite pass.
     dtype: types.DType = None
     dim: types.Any = None
     items_per_thread: int = None
     algorithm_id: int = None
     runtime_args: tuple = None
+    runtime_args_types: tuple = None
     expr_args: list = None
     expr_args_no_longer_needed: list = None
     src: types.Any = None
@@ -88,6 +103,15 @@ class CoopStmt:
     @cached_property
     def expr_name(self):
         return f"{self.granularity.name.lower()}_{self.primitive.name.lower()}"
+
+    @cached_property
+    def c_name(self):
+        # Need to obtain the mangled name depending the template parameter
+        # match.
+        name = (
+            self.instance.specialization.mangled_names_alloc[0]
+        )
+        return name
 
     @cached_property
     def granularity(self):
@@ -142,6 +166,7 @@ class CoopStmt:
     def is_warp(self):
         return self.granularity == Granularity.WARP
 
+COUNT = 0
 
 def _lower_block_load_or_store(lowerer, expr):
     """
@@ -153,7 +178,21 @@ def _lower_block_load_or_store(lowerer, expr):
 
     cs = expr.coop_stmt
     algo = cs.instance.specialization
+    #import IPython; IPython.embed()
     print(f"Lowering {cs.template} with specialization: {algo}")
+
+    algo.generate_source(cs.threads)
+    source_code = algo.source_code
+    lib = context.active_code_library
+
+    global COUNT
+    COUNT += 1
+    if COUNT == 1:
+        import IPython; IPython.embed(colors="Linux")
+
+
+    print('Leaving...')
+
 
 
 
@@ -190,6 +229,7 @@ class InterceptCooperativeCalls(Rewrite):
         if "block_store" not in special_ops:
             special_ops["block_store"] = _lower_block_load_or_store
 
+        self.state = state
         self.remove_map = {}
         self.match_count = 0
         self.apply_count = 0
@@ -242,6 +282,7 @@ class InterceptCooperativeCalls(Rewrite):
             coop_stmt = CoopStmt(
                 index=i,
                 block_line=block.loc.line,
+                state=self.state,
                 expr=expr,
                 instr=instr,
                 template=template,
@@ -282,10 +323,18 @@ class InterceptCooperativeCalls(Rewrite):
             src = expr_args.pop(0)
             dst = expr_args.pop(0)
             runtime_args = [src, dst]
+            runtime_args_types = (
+                self.typemap[src.name],
+                self.typemap[dst.name],
+            )
         else:
             dst = expr_args.pop(0)
             src = expr_args.pop(0)
             runtime_args = [dst, src]
+            runtime_args_types = (
+                self.typemap[dst.name],
+                self.typemap[src.name],
+            )
 
         arg_ty = self.typemap[src.name]
         assert isinstance(arg_ty, types.Array)
@@ -337,6 +386,7 @@ class InterceptCooperativeCalls(Rewrite):
         cs.src = src
         cs.dst = dst
         cs.runtime_args = runtime_args
+        cs.runtime_args_types = runtime_args_types
 
     def _handle_load_or_store(self, coop_stmt):
         """
