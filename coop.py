@@ -154,12 +154,25 @@ def main():
     k = jk[1, threads_per_block]
     try:
         k(d_a, d_b)
+        cuda.synchronize()
     except Exception as e:
         print(f"Error: {e}")
         print(f"Source code: {source_code}")
         raise e
     else:
         print(f"Kernel {num} executed")
+
+    # Copy d_a and d_b back to h_a and h_b and compare against each other.
+    import numpy as np
+    h_a = d_a.copy_to_host()
+    h_b = d_b.copy_to_host()
+    print(f'a: {a}')
+    print(f'b: {b}')
+    print(f"h_a: {h_a}")
+    print(f"h_b: {h_b}")
+    np.testing.assert_array_equal(
+        h_a, h_b, err_msg=f"Kernel {num} failed: h_a != h_b"
+    )
 
 
 if __name__ == "__main__":

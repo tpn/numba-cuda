@@ -172,6 +172,17 @@ class CoopStmt:
     def is_warp(self):
         return self.granularity == Granularity.WARP
 
+    @property
+    def codegen(self):
+        assert len(self.codegens) == 2, (
+            len(self.codegens), self.codegens
+        )
+        if self.implicit_temp_storage:
+            idx = 1
+        else:
+            idx = 0
+        return self.codegens[idx]
+
 COUNT = 0
 
 def _lower_block_load_or_store(lowerer, expr):
@@ -434,6 +445,7 @@ class InterceptCooperativeCalls(Rewrite):
         #    pass
         #invocable = cs.invocable = instance.invocable
         cs.invocable = instance.invocable = invocable
+        invocable.cs = cs
 
         g_assign = ir.Assign(
             value=ir.Global(g_var_name, invocable, expr.loc),
@@ -485,74 +497,52 @@ class InterceptCooperativeCalls(Rewrite):
         #self.calltypes[new_expr] = sig
         self.calltypes[new_call] = sig
 
+        algo = instance.specialization
+        cs.codegens = algo.create_codegens()
+
         from numba.cuda.cudadecl import register_global
         from numba.cuda.cudaimpl import lower
 
         @register_global(invocable)
         class ImplDecl(AbstractTemplate):
             key = invocable
-            def generic(self, args, kws):
+            def generic(self, outer_args, outer_kws):
 
                 @lower(invocable, types.VarArg(types.Any))
                 def codegen(context, builder, sig, args):
-                    print(f"Codegen called with {args}")
-                    return builder.call(invocable, args)
+                    cs = invocable.cs
+                    cg = cs.codegen
+                    (_, codegen_method) = cg.intrinsic_impl()
+                    res = codegen_method(context, builder, sig, args)
+
+                    # Add all the LTO-IRs to the current code library.
+                    lib = context.active_code_library
+                    algo = cs.instance.specialization
+                    algo.generate_source(cs.threads)
+                    for ltoir in algo.lto_irs:
+                        lib.add_linking_file(ltoir)
+                    # None of these appear to work.
+                    lib._lto = True
+                    cs.state.flags.lto = True
+
+                    return res
 
                 return sig
 
-        if False:
-            template_name = ir_utils.mk_unique_var(cs.call_var_name)
-            template_name = template_name.replace(".", "_")
-            new_concrete_template = make_concrete_template(
-                name=template_name,
-                key=invocable,
-                signatures=[sig],
-            )
-
-        if False:
-            if cs.implicit_temp_storage:
-                new_template = make_callable_template(
-                    key=invocable,
-                    typer=impl_class._typer_implicit_temp_storage,
-                    recvr=None,
-                )
-            else:
-                new_template = make_callable_template(
-                    key=invocable,
-                    typer=impl_class._typer_explicit_temp_storage,
-                    recvr=None,
-                )
-
-                type_info = typed_passes.type_inference_stage(
-                typingctx,
-                targetctx,
-                f_ir,
-                arg_typs,
-                return_type=None,
-            )
-            (f_typemap, f_return_type, f_calltypes, errors) = type_info
-
-        #func_ty = types.Function(new_callable_template)
-        #func_ty = types.FunctionType(new_template)
-        #func_ty = types.FunctionType(new_concrete_template)
-        #func_ty = types.Function(new_concrete_template)
-        #func_ty = types.FunctionType(new_concrete_template)
         func_ty = types.Function(ImplDecl)
 
+        # This nonsense appears to be required because, without it, a
+        # `KeyError` gets hit because func_ty's _impl_keys dict is empty.
+        # I can't imagine any of this is the canonical (or even correct) way
+        # to do this.
         typingctx = self.state.typingctx
         result = func_ty.get_call_type(
             typingctx,
             args=(first_ty, second_ty),
             kws={},
         )
-
         check = func_ty._impl_keys[sig.args]
         assert check is not None, check
-
-        # I can't imagine this is the correct way to achieve this.
-        #func_ty._impl_keys = {
-        #    sig.args: invocable,
-        #}
 
         existing = self.typemap.get(g_var.name, None)
         if existing:
@@ -560,25 +550,6 @@ class InterceptCooperativeCalls(Rewrite):
                 f"Variable {g_var.name} already exists in typemap."
             )
         self.typemap[g_var.name] = func_ty
-
-        if False:
-            algo = instance.specialization
-            cg = algo.codegen_other()
-
-            if cs.implicit_temp_storage:
-                target = cg[1]
-            else:
-                target = cg[0]
-            algo.do_overload(invocable, target)
-        elif False:
-            algo = instance.specialization
-            algo.codegen(invocable)
-        else:
-            pass
-
-
-        #targetctx = self.state.targetctx
-        #typingctx = self.state.typingctx
 
         return (g_assign, new_assign)
 

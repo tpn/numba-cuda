@@ -3282,7 +3282,7 @@ class PyNvJitLinker(Linker):
         max_registers=None,
         lineinfo=False,
         cc=None,
-        lto=False,
+        lto=True,
         additional_flags=None,
     ):
         if NvJitLinker is None:

@@ -583,6 +583,7 @@ class Algorithm:
         self.mangled_names = []
         self.mangled_names_alloc = []
         self.source_code = None
+        self._lto_irs = []
 
     def __repr__(self) -> str:
         return f"{self.struct_name}::{self.method_name}{self.template_parameters}: {self.parameters}"
@@ -680,6 +681,8 @@ class Algorithm:
     def generate_source(self, threads=None):
         if self.source_code is not None:
             return
+
+        lto_irs = self._lto_irs
 
         if self.type_definitions:
             for type_definition in self.type_definitions:
@@ -831,31 +834,42 @@ class Algorithm:
 
     @cached_property
     def lto_irs(self):
-        lto_irs = []
-
         if self.source_code is None:
             raise RuntimeError(
                 "Source code must be generated before LTO IRs can be created"
             )
 
+        # Pick up any LTO IRs from type definitions.
+        lto_irs = self._lto_irs
+
         device = cuda.get_current_device()
         cc_major, cc_minor = device.compute_capability
         cc = cc_major * 10 + cc_minor
-        _, ltoir_blob = nvrtc.compile(
+        code_type = "lto"
+        _, blob = nvrtc.compile(
             cpp=self.source_code,
             cc=cc,
             rdc=True,
-            code="lto",
+            code=code_type,
         )
-        from numba.cuda import LTOIR
-        ltoir = LTOIR(
-            name=self.c_name,
-            data=ltoir_blob,
-        )
-        lto_irs.append(ltoir)
+        if code_type == "ptx":
+            from numba.cuda import PTXSource
+            obj = PTXSource(
+                name=self.c_name,
+                data=blob.encode('utf-8'),
+            )
+        elif code_type == "lto":
+            from numba.cuda import LTOIR
+            obj = LTOIR(
+                name=self.c_name,
+                data=blob,
+            )
+        else:
+            raise ValueError(f"Unknown code type: {code_type}")
+        lto_irs.append(obj)
         return lto_irs
 
-    def codegen_other(self, parameters=None):
+    def create_codegens(self, parameters=None):
         if len(self.template_parameters):
             raise ValueError("Cannot generate codegen for a template")
 
@@ -878,13 +892,13 @@ class Algorithm:
         for method in parameters:
             mangled_name = self.mangled_name(method)
             results.append(
-                self.codegen_method_other(
+                self.create_codegen_method(
                     method,
                     mangled_name,
                 )
             )
             results.append(
-                self.codegen_method_other(
+                self.create_codegen_method(
                     method[1:],
                     mangled_name + "_alloc"
                 )
@@ -892,7 +906,7 @@ class Algorithm:
 
         return results
 
-    def codegen_method_other(self, method, mangled_name):
+    def create_codegen_method(self, method, mangled_name):
         if len(self.template_parameters):
             raise ValueError("Cannot generate codegen for a template")
 
@@ -905,7 +919,7 @@ class Algorithm:
             )
             return ignore
 
-        def intrinsic_impl(*args):
+        def intrinsic_impl(*outer_args):
             def codegen(context, builder, sig, args):
                 types = []
                 arguments = []
@@ -1043,7 +1057,7 @@ class Algorithm:
             )
             return ignore
 
-        def intrinsic_impl(*args):
+        def intrinsic_impl(*outer_args):
             def codegen(context, builder, sig, args):
                 types = []
                 arguments = []
@@ -1144,7 +1158,7 @@ class Algorithm:
             algorithm_impl, num_user_provided_params
         )
         overload(func_to_overload, target="cuda")(wrapped_algorithm_impl)
-    
+
 
 
 class Invocable:

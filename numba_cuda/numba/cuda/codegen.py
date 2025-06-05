@@ -124,7 +124,7 @@ class CUDACodeLibrary(serialize.ReduceMixin, CodeLibrary):
         name,
         entry_name=None,
         max_registers=None,
-        lto=False,
+        lto=True,
         nvvm_options=None,
     ):
         """
@@ -177,7 +177,7 @@ class CUDACodeLibrary(serialize.ReduceMixin, CodeLibrary):
         self._cufunc_cache = {}
 
         self._max_registers = max_registers
-        self._lto = lto
+        self._lto = True
         if nvvm_options is None:
             nvvm_options = {}
         self._nvvm_options = nvvm_options
