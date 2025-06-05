@@ -1,12 +1,6 @@
 from functools import cached_property
 from io import StringIO
 
-#from numba.cuda import CUsource
-
-# Steal some ideas from Michal Yang's example rewrite on the 4776 issue
-# (https://github.com/NVIDIA/cccl/issues/4776#issuecomment-2899508543)
-# regarding keyed StringIO, shim source, etc.
-
 class _KeyedStringIO(StringIO):
     def __init__(self, *arg, **kwarg):
         super().__init__(*arg, *kwarg)
@@ -31,6 +25,10 @@ class BasePrimitive:
     @property
     def temp_storage_alignment(self):
         return self.specialization.temp_storage_alignment
+
+    @cached_property
+    def lto_irs(self):
+        return self.specialization.lto_irs
 
     @cached_property
     def temp_files(self):

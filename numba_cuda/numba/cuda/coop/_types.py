@@ -94,13 +94,18 @@ class TypeWrapper:
         """)
             self.code = template.render(**parameters)
 
+            from numba.cuda import LTOIR
             for method in methods:
-                lto_fn, _ = cuda.compile(
+                ltoir_blob, _ = cuda.compile(
                     methods[method],
                     sig=method_to_signature(numba_type, method),
                     output="ltoir",
                 )
-                self.lto_irs.append(lto_fn)
+                ltoir = LTOIR(
+                    name=f"udt_{numba_type!s}_{method}",
+                    data=ltoir_blob,
+                )
+                self.lto_irs.append(ltoir)
 
 
 def numba_type_to_wrapper(
@@ -397,6 +402,7 @@ class DependentPythonOperator:
                 types.CPointer(arg_dtype) if arg_cpp_type == "storage_t" else arg_dtype
             )
 
+        from numba.cuda import LTOIR
         if isinstance(op, StatefulFunction):
             binary_op = op.op.__call__
             mangled_name = f"F{binary_op.__name__}_{ret_dtype}__" + "_".join(arg_dtypes)
@@ -412,8 +418,12 @@ class DependentPythonOperator:
                     ret_numba_type, types.CPointer(op.dtype), *arg_numba_types
                 )
             abi_info = {"abi_name": mangled_name}
-            ltoir, _ = cuda.compile(
+            ltoir_blob, _ = cuda.compile(
                 binary_op, sig=binary_op_signature, output="ltoir", abi_info=abi_info
+            )
+            ltoir = LTOIR(
+                name=f"udf_{mangled_name}",
+                data=ltoir_blob,
             )
             return StatefulOperator(
                 mangled_name, op.dtype, ret_cpp_type, arg_cpp_types, ltoir
@@ -428,10 +438,19 @@ class DependentPythonOperator:
             else:
                 binary_op_signature = signature(ret_numba_type, *arg_numba_types)
             abi_info = {"abi_name": mangled_name}
-            ltoir, _ = cuda.compile(
+            ltoir_blob, _ = cuda.compile(
                 binary_op, sig=binary_op_signature, output="ltoir", abi_info=abi_info
             )
-            return StatelessOperator(mangled_name, ret_cpp_type, arg_cpp_types, ltoir)
+            ltoir = LTOIR(
+                name=f"udf_{mangled_name}",
+                data=ltoir_blob,
+            )
+            return StatelessOperator(
+                mangled_name,
+                ret_cpp_type,
+                arg_cpp_types,
+                ltoir,
+            )
 
 
 class CxxFunction(Parameter):
@@ -563,8 +582,6 @@ class Algorithm:
         self.fake_return = fake_return
         self.mangled_names = []
         self.mangled_names_alloc = []
-        # Keyed by (tuple(Parameters), mangled_name)
-        self._codegen = {}
         self.source_code = None
 
     def __repr__(self) -> str:
@@ -812,25 +829,33 @@ class Algorithm:
 
         self.source_code = src
 
-    def get_lto_ir(self, threads=None):
+    @cached_property
+    def lto_irs(self):
         lto_irs = []
 
-        self.generate_source(threads)
+        if self.source_code is None:
+            raise RuntimeError(
+                "Source code must be generated before LTO IRs can be created"
+            )
 
         device = cuda.get_current_device()
         cc_major, cc_minor = device.compute_capability
         cc = cc_major * 10 + cc_minor
-        _, lto_fn = nvrtc.compile(
+        _, ltoir_blob = nvrtc.compile(
             cpp=self.source_code,
             cc=cc,
             rdc=True,
             code="lto",
         )
-        lto_irs.append(lto_fn)
-        self.lto_irs = lto_irs
+        from numba.cuda import LTOIR
+        ltoir = LTOIR(
+            name=self.c_name,
+            data=ltoir_blob,
+        )
+        lto_irs.append(ltoir)
         return lto_irs
 
-    def codegen(self, parameters=None):
+    def codegen_other(self, parameters=None):
         if len(self.template_parameters):
             raise ValueError("Cannot generate codegen for a template")
 
@@ -839,7 +864,7 @@ class Algorithm:
         if parameters is None:
             parameters = self.parameters
         else:
-            if not isiterable(parameters):
+            if not isinstance(parameters, (list, tuple)):
                 parameters = [parameters]
             # Ensure all parameters are ones we know about.
             given_parameters = set(tuple(p) for p in parameters)
@@ -853,13 +878,13 @@ class Algorithm:
         for method in parameters:
             mangled_name = self.mangled_name(method)
             results.append(
-                self.codegen_method(
+                self.codegen_method_other(
                     method,
                     mangled_name,
                 )
             )
             results.append(
-                self.codegen_method(
+                self.codegen_method_other(
                     method[1:],
                     mangled_name + "_alloc"
                 )
@@ -867,7 +892,7 @@ class Algorithm:
 
         return results
 
-    def codegen_method(self, method, mangled_name):
+    def codegen_method_other(self, method, mangled_name):
         if len(self.template_parameters):
             raise ValueError("Cannot generate codegen for a template")
 
@@ -982,6 +1007,8 @@ class Algorithm:
         )
 
         cg = SimpleNamespace(
+            method=method,
+            mangled_name=mangled_name,
             intrinsic_impl=intrinsic_impl,
             numba_intrinsic=numba_intrinsic,
             algorithm_impl=algorithm_impl,
@@ -990,11 +1017,134 @@ class Algorithm:
 
         return cg
 
-    def do_overload(self, cg):
-        overload(
-            func_to_overload,
-            target="cuda")
-        (cg.wrapped_algorithm_impl)
+    def do_overload(self, func, cg):
+        overload(func, target="cuda")(cg.wrapped_algorithm_impl)
+
+    def codegen(self, func_to_overload):
+        if len(self.template_parameters):
+            raise ValueError("Cannot generate codegen for a template")
+
+        for method in self.parameters:
+            self.codegen_method(func_to_overload, method, self.mangled_name(method))
+            self.codegen_method(
+                func_to_overload, method[1:], self.mangled_name(method) + "_alloc"
+            )
+
+    def codegen_method(self, func_to_overload, method, mangled_name):
+        if len(self.template_parameters):
+            raise ValueError("Cannot generate codegen for a template")
+
+        def ignore_param(param):
+            # Stateless operators and C++ functions do not require any
+            # additional argument handling or code generation, so we can
+            # safely ignore them during this code gen phase.
+            ignore = isinstance(param, StatelessOperator) or isinstance(
+                param, CxxFunction
+            )
+            return ignore
+
+        def intrinsic_impl(*args):
+            def codegen(context, builder, sig, args):
+                types = []
+                arguments = []
+                ret = None
+                arg_id = 0
+                for param in method:
+                    if ignore_param(param):
+                        continue
+
+                    dtype = param.dtype()
+                    if isinstance(param, StatefulOperator):
+                        arg = args[arg_id]
+                        state_ptr = cgutils.create_struct_proxy(dtype)(
+                            context, builder, arg
+                        ).data
+                        void_ptr = builder.bitcast(
+                            state_ptr, ir.PointerType(ir.IntType(8))
+                        )
+                        types.append(ir.PointerType(ir.IntType(8)))
+                        arguments.append(void_ptr)
+                    elif isinstance(param, Reference):
+                        if param.is_output:
+                            ptr = cgutils.alloca_once(
+                                builder, context.get_value_type(dtype)
+                            )
+                            void_ptr = builder.bitcast(
+                                ptr, ir.PointerType(ir.IntType(8))
+                            )
+                            types.append(ir.PointerType(ir.IntType(8)))
+                            arguments.append(void_ptr)
+                            ret = ptr
+                        else:
+                            arg = args[arg_id]
+                            ptr = cgutils.alloca_once_value(builder, arg)
+                            data_type = context.get_value_type(dtype)
+                            void_ptr = builder.bitcast(
+                                ptr, ir.PointerType(ir.IntType(8))
+                            )
+                            types.append(ir.PointerType(ir.IntType(8)))
+                            arguments.append(void_ptr)
+                    elif isinstance(param, Array) or isinstance(param, Pointer):
+                        if param.is_output:
+                            raise ValueError("Output arrays not supported")
+                        arg = args[arg_id]
+                        data_type = context.get_value_type(dtype.dtype)
+                        types.append(ir.PointerType(data_type))
+                        arguments.append(
+                            cgutils.create_struct_proxy(dtype)(
+                                context, builder, arg
+                            ).data
+                        )
+                    else:
+                        if param.is_output:
+                            raise ValueError("Output values not supported")
+                        arg = args[arg_id]
+                        data_type = context.get_value_type(dtype)
+                        types.append(data_type)
+                        arguments.append(arg)
+
+                    if not param.is_output:
+                        arg_id += 1
+
+                function_type = ir.FunctionType(ir.VoidType(), types)
+                function = cgutils.get_or_insert_function(
+                    builder.module, function_type, mangled_name
+                )
+                builder.call(function, arguments)
+
+                if ret is not None:
+                    return builder.load(ret)
+
+            params = []
+            ret = numba.types.void
+            for param in method:
+                if ignore_param(param):
+                    continue
+
+                if param.is_output:
+                    if ret is not numba.types.void:
+                        raise ValueError("Multiple output parameters not supported")
+                    ret = param.dtype()
+                else:
+                    params.append(param.dtype())
+
+            return signature(ret, *params), codegen
+
+        num_user_provided_params = sum(
+            [param.is_provided_by_user() for param in method]
+        )
+        numba_intrinsic = intrinsic(
+            war_introspection(intrinsic_impl, 1 + num_user_provided_params)
+        )
+
+        def algorithm_impl(*args):
+            return war_introspection(numba_intrinsic, len(args))
+
+        wrapped_algorithm_impl = war_introspection(
+            algorithm_impl, num_user_provided_params
+        )
+        overload(func_to_overload, target="cuda")(wrapped_algorithm_impl)
+    
 
 
 class Invocable:
@@ -1004,12 +1154,12 @@ class Invocable:
 
     def lower(
         self,
-        temp_files: Sequence[BinaryIO],
+        lto_irs: Sequence["LTOIR"],
         temp_storage_bytes: int,
         temp_storage_alignment: int,
         algorithm: Algorithm,
     ):
-        self._temp_files = temp_files
+        self._lto_irs = lto_irs
         self._temp_storage_bytes = temp_storage_bytes
         self._temp_storage_alignment = temp_storage_alignment
         algorithm.codegen(self)

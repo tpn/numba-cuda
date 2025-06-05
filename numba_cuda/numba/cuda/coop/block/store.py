@@ -72,7 +72,7 @@ class store(BasePrimitive):
     def _typer_explicit_temp_storage(temp_storage, src, dst):
         return signature(
             types.none,
-            args=(src, dst, temp_storage),
+            args=(temp_storage, src, dst),
             recvr=None,
             pysig=None,
         )

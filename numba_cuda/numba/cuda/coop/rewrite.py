@@ -1,6 +1,7 @@
 # cuda.cooperative
+import sys
 
-from numba.core.typing.templates import CallableTemplate
+from numba.core.typing.templates import CallableTemplate, AbstractTemplate
 
 from enum import IntEnum
 from functools import cached_property
@@ -13,7 +14,7 @@ from numba.core.typing.templates import (
 )
 
 # coop_rewrite.py  –  put this on your PYTHONPATH
-from numba.core import ir, types, ir_utils
+from numba.core import ir, types, ir_utils, funcdesc
 from numba.core.typing import signature
 from numba.core.rewrites import register_rewrite, Rewrite
 from numba import cuda
@@ -24,6 +25,7 @@ from numba.core import config
 from . import block
 
 config.DEBUG = True
+#config.DEBUG_JIT = True
 config.DUMP_IR = True
 config.CUDA_ENABLE_PYNVJITLINK = True
 
@@ -84,7 +86,8 @@ class CoopStmt:
     items_per_thread: int = None
     algorithm_id: int = None
     runtime_args: tuple = None
-    runtime_args_types: tuple = None
+    runtime_arg_names: tuple = None
+    runtime_arg_types: tuple = None
     expr_args: list = None
     expr_args_no_longer_needed: list = None
     src: types.Any = None
@@ -94,11 +97,14 @@ class CoopStmt:
 
     @cached_property
     def call_var_name(self):
-        return (
+        name = (
             f"{self.granularity.name.lower()}_"
             f"{self.primitive.name.lower()}_"
             f"{self.block_line}_{self.index}"
         )
+        if self.implicit_temp_storage:
+            name += "_alloc"
+        return name
 
     @cached_property
     def expr_name(self):
@@ -323,18 +329,21 @@ class InterceptCooperativeCalls(Rewrite):
             src = expr_args.pop(0)
             dst = expr_args.pop(0)
             runtime_args = [src, dst]
-            runtime_args_types = (
+            runtime_arg_types = (
                 self.typemap[src.name],
                 self.typemap[dst.name],
             )
+            runtime_arg_names = ('src', 'dst')
+
         else:
             dst = expr_args.pop(0)
             src = expr_args.pop(0)
             runtime_args = [dst, src]
-            runtime_args_types = (
+            runtime_arg_types = (
                 self.typemap[dst.name],
                 self.typemap[src.name],
             )
+            runtime_arg_names = ('dst', 'src')
 
         arg_ty = self.typemap[src.name]
         assert isinstance(arg_ty, types.Array)
@@ -386,7 +395,8 @@ class InterceptCooperativeCalls(Rewrite):
         cs.src = src
         cs.dst = dst
         cs.runtime_args = runtime_args
-        cs.runtime_args_types = runtime_args_types
+        cs.runtime_arg_types = runtime_arg_types
+        cs.runtime_arg_names = runtime_arg_names
 
     def _handle_load_or_store(self, coop_stmt):
         """
@@ -409,7 +419,21 @@ class InterceptCooperativeCalls(Rewrite):
             cs.items_per_thread,
             cs.algorithm_id,
         )
-        invocable = cs.invocable = instance.invocable
+
+        from textwrap import dedent
+        code = dedent(f"""
+            def {cs.call_var_name}(*args):
+                return
+        """)
+        exec(code, globals())
+        invocable = globals()[cs.call_var_name]
+        mod = sys.modules[invocable.__module__]
+        setattr(mod, cs.call_var_name, invocable)
+
+        #def invocable(*args):
+        #    pass
+        #invocable = cs.invocable = instance.invocable
+        cs.invocable = instance.invocable = invocable
 
         g_assign = ir.Assign(
             value=ir.Global(g_var_name, invocable, expr.loc),
@@ -423,6 +447,7 @@ class InterceptCooperativeCalls(Rewrite):
             kws=(),
             loc=expr.loc,
         )
+        #new_call.coop_stmt = cs
 
         new_expr = ir.Expr(
             op=cs.expr_name,
@@ -434,8 +459,8 @@ class InterceptCooperativeCalls(Rewrite):
         )
 
         new_assign = ir.Assign(
-            #value=new_call,
-            value=new_expr,
+            value=new_call,
+            #value=new_expr,
             target=cs.instr.target,
             loc=cs.instr.loc,
         )
@@ -457,30 +482,77 @@ class InterceptCooperativeCalls(Rewrite):
             pysig=None,
         )
 
-        self.calltypes[new_expr] = sig
+        #self.calltypes[new_expr] = sig
+        self.calltypes[new_call] = sig
 
-        # Update typemap/calltypes for the new call.
+        from numba.cuda.cudadecl import register_global
+        from numba.cuda.cudaimpl import lower
 
-        new_template = make_concrete_template(
-            name=f"{impl_class.__name__}_implicit_temp_storage",
-            key=invocable,
-            signatures=[sig],
-        )
+        @register_global(invocable)
+        class ImplDecl(AbstractTemplate):
+            key = invocable
+            def generic(self, args, kws):
 
-        new_template = make_callable_template(
-            key=invocable,
-            typer=impl_class._typer_implicit_temp_storage,
-            recvr=None,
-        )
+                @lower(invocable, types.VarArg(types.Any))
+                def codegen(context, builder, sig, args):
+                    print(f"Codegen called with {args}")
+                    return builder.call(invocable, args)
 
+                return sig
+
+        if False:
+            template_name = ir_utils.mk_unique_var(cs.call_var_name)
+            template_name = template_name.replace(".", "_")
+            new_concrete_template = make_concrete_template(
+                name=template_name,
+                key=invocable,
+                signatures=[sig],
+            )
+
+        if False:
+            if cs.implicit_temp_storage:
+                new_template = make_callable_template(
+                    key=invocable,
+                    typer=impl_class._typer_implicit_temp_storage,
+                    recvr=None,
+                )
+            else:
+                new_template = make_callable_template(
+                    key=invocable,
+                    typer=impl_class._typer_explicit_temp_storage,
+                    recvr=None,
+                )
+
+                type_info = typed_passes.type_inference_stage(
+                typingctx,
+                targetctx,
+                f_ir,
+                arg_typs,
+                return_type=None,
+            )
+            (f_typemap, f_return_type, f_calltypes, errors) = type_info
 
         #func_ty = types.Function(new_callable_template)
-        func_ty = types.Function(new_template)
+        #func_ty = types.FunctionType(new_template)
+        #func_ty = types.FunctionType(new_concrete_template)
+        #func_ty = types.Function(new_concrete_template)
+        #func_ty = types.FunctionType(new_concrete_template)
+        func_ty = types.Function(ImplDecl)
+
+        typingctx = self.state.typingctx
+        result = func_ty.get_call_type(
+            typingctx,
+            args=(first_ty, second_ty),
+            kws={},
+        )
+
+        check = func_ty._impl_keys[sig.args]
+        assert check is not None, check
 
         # I can't imagine this is the correct way to achieve this.
-        func_ty._impl_keys = {
-            sig.args: invocable,
-        }
+        #func_ty._impl_keys = {
+        #    sig.args: invocable,
+        #}
 
         existing = self.typemap.get(g_var.name, None)
         if existing:
@@ -488,6 +560,25 @@ class InterceptCooperativeCalls(Rewrite):
                 f"Variable {g_var.name} already exists in typemap."
             )
         self.typemap[g_var.name] = func_ty
+
+        if False:
+            algo = instance.specialization
+            cg = algo.codegen_other()
+
+            if cs.implicit_temp_storage:
+                target = cg[1]
+            else:
+                target = cg[0]
+            algo.do_overload(invocable, target)
+        elif False:
+            algo = instance.specialization
+            algo.codegen(invocable)
+        else:
+            pass
+
+
+        #targetctx = self.state.targetctx
+        #typingctx = self.state.typingctx
 
         return (g_assign, new_assign)
 

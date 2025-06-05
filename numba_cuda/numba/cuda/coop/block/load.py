@@ -73,7 +73,7 @@ class load(BasePrimitive):
     def _typer_explicit_temp_storage(temp_storage, src, dst):
         return signature(
             types.none,
-            args=(src, dst, temp_storage),
+            args=(temp_storage, src, dst),
             recvr=None,
             pysig=None,
         )
@@ -122,24 +122,4 @@ class load(BasePrimitive):
             }
         )
 
-        #self.temp_storage_bytes = self.specialization.temp_storage_bytes
-        #self.temp_storage_alignment = self.specialization.temp_storage_alignment
 
-    @property
-    def temp_storage_bytes(self):
-        return self.specialization.temp_storage_bytes
-
-    @property
-    def temp_storage_alignment(self):
-        return self.specialization.temp_storage_alignment
-
-    @cached_property
-    def temp_files(self):
-        return [
-            make_binary_tempfile(ltoir, ".ltoir")
-            for ltoir in self.specialization.get_lto_ir()
-        ]
-
-    @cached_property
-    def invocable(self):
-        return Invocable()
