@@ -826,7 +826,10 @@ class CUDADispatcher(Dispatcher, serialize.ReduceMixin):
         if self.specialized:
             kernel = next(iter(self.overloads.values()))
         else:
+            launch_config = (griddim, blockdim, stream, sharedmem)
+            self.typingctx.launch_config = launch_config
             kernel = _dispatcher.Dispatcher._cuda_call(self, *args)
+            self.typingctx.launch_config = None
 
         kernel.launch(args, griddim, blockdim, stream, sharedmem)
 
